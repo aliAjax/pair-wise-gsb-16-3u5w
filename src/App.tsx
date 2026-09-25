@@ -1,159 +1,304 @@
+import { useEffect, useMemo, useState } from "react";
 import "./styles.css";
+import type {
+  AppData,
+  Audiogram,
+  ContactNote,
+  Patient,
+  PromptMethod,
+  TrainingLog,
+} from "./types";
+import { loadData, resetData, saveData } from "./storage/store";
+import {
+  currentWeekKey,
+  todayKey,
+  weekKeyOfDate,
+  weekLabel,
+} from "./rules/dates";
+import { newId } from "./rules/ids";
+import {
+  canCreatePlan,
+  createPlan,
+  latestAudiogram,
+  revisePlan,
+} from "./rules/plans";
+import { buildFollowupList } from "./rules/followup";
+import { weekProgress } from "./rules/progress";
+import { Workbench } from "./components/Workbench";
+import { FollowupView } from "./components/FollowupView";
+import { PatientsView } from "./components/PatientsView";
+import { AudiogramModal } from "./components/AudiogramModal";
+import type { PlanDraft } from "./rules/plans";
 
-const project = {
-  "id": "hxwl-01",
-  "port": 5101,
-  "title": "听力验配记录",
-  "subtitle": "门店听力师的验配档案与听力曲线工作台",
-  "stack": "React + Vite + TypeScript + CSS",
-  "theme": [
-    "#155e75",
-    "#22c55e",
-    "#f97316"
-  ],
-  "domain": "听力验配",
-  "users": [
-    "听力师",
-    "门店主管",
-    "复诊助理"
-  ],
-  "metrics": [
-    "左耳PTA",
-    "右耳PTA",
-    "言语识别率",
-    "复诊天数"
-  ],
-  "filters": [
-    "初配",
-    "复调",
-    "儿童",
-    "老人"
-  ],
-  "fields": [
-    "气导",
-    "骨导",
-    "言语识别率",
-    "助听器型号",
-    "增益调整",
-    "用户反馈"
-  ],
-  "records": [
-    [
-      "Liu-024",
-      "双耳高频下降",
-      "初配",
-      "RIC机型，2kHz后增益提高4dB"
-    ],
-    [
-      "Chen-118",
-      "单侧传导性损失",
-      "复调",
-      "低频压缩略降，反馈啸叫已消失"
-    ],
-    [
-      "Zhao-077",
-      "老人语频区下降",
-      "复诊",
-      "言语识别率从64%提升到76%"
-    ]
-  ]
-};
+type View = "workbench" | "followup" | "patients";
 
-const statusColors = ["status-ok", "status-watch", "status-danger"];
+export default function App() {
+  const [data, setData] = useState<AppData>(() => loadData());
+  const [view, setView] = useState<View>("workbench");
+  const [selectedId, setSelectedId] = useState<string>(() => data.patients[0]?.id ?? "");
+  const [audiEditId, setAudiEditId] = useState<string | null>(null);
+  const [toast, setToast] = useState("");
 
-function MetricCard({ label, value, index }: { label: string; value: string; index: number }) {
+  useEffect(() => {
+    const result = saveData(data);
+    if (!result.ok) setToast(`数据保存失败：${result.error}`);
+  }, [data]);
+
+  useEffect(() => {
+    if (!toast) return;
+    const t = window.setTimeout(() => setToast(""), 2600);
+    return () => window.clearTimeout(t);
+  }, [toast]);
+
+  const weekKey = currentWeekKey();
+  const stats = useMemo(() => {
+    const followup = buildFollowupList(data);
+    const planned = new Set(
+      data.plans.filter((p) => p.weekKey === weekKey).map((p) => p.patientId),
+    );
+    let done = 0;
+    for (const p of data.patients) done += weekProgress(data, p.id, weekKey).done;
+    const pendingLogs = data.logs.filter((l) => l.weekKey === weekKey).length;
+    return { followup: followup.length, planned: planned.size, done, pendingLogs };
+  }, [data, weekKey]);
+
+  const selectedPatient = data.patients.find((p) => p.id === selectedId) ?? data.patients[0];
+
+  // ---------- 患者 ----------
+  const addPatient = (p: Omit<Patient, "id" | "joinedAt">) => {
+    const patient: Patient = { ...p, id: newId("p"), joinedAt: todayKey() };
+    setData((d) => ({ ...d, patients: [...d.patients, patient] }));
+    setSelectedId(patient.id);
+    setView("workbench");
+    setToast("已建档，请录入并核对听力曲线");
+  };
+
+  const updatePromptPreference = (patientId: string, method: PromptMethod, detail: string) => {
+    setData((d) => ({
+      ...d,
+      patients: d.patients.map((p) =>
+        p.id === patientId ? { ...p, promptMethod: method, promptDetail: detail } : p,
+      ),
+    }));
+    setToast("家属提示偏好已保存");
+  };
+
+  // ---------- 听力曲线 ----------
+  const checkAudiogram = (audiogramId: string) => {
+    const target = data.audiograms.find((a) => a.id === audiogramId);
+    setData((d) => ({
+      ...d,
+      audiograms: d.audiograms.map((a) =>
+        a.id === audiogramId
+          ? { ...a, checkedBy: d.meta.specialist, checkedAt: new Date().toISOString() }
+          : a,
+      ),
+    }));
+    setToast(`${data.meta.specialist} 已核对听力曲线（${target?.testDate ?? ""}），可以生成计划`);
+  };
+
+  const saveAudiogram = (
+    patientId: string,
+    next: { testDate: string; left: number[]; right: number[] },
+  ) => {
+    setData((d) => {
+      const existing = latestAudiogram(d, patientId);
+      if (existing) {
+        const untouched =
+          existing.testDate === next.testDate &&
+          existing.left.every((v, i) => v === next.left[i]) &&
+          existing.right.every((v, i) => v === next.right[i]);
+        // 内容一旦变更，核对作废，必须重新核对
+        const cleared = untouched
+          ? {}
+          : { checkedBy: null, checkedAt: null };
+        return {
+          ...d,
+          audiograms: d.audiograms.map((a) =>
+            a.id === existing.id ? { ...a, ...next, ...cleared } : a,
+          ),
+        };
+      }
+      const audiogram: Audiogram = {
+        id: newId("a"),
+        patientId,
+        ...next,
+        checkedBy: null,
+        checkedAt: null,
+      };
+      return { ...d, audiograms: [...d.audiograms, audiogram] };
+    });
+    setAudiEditId(null);
+    setToast("听力曲线已保存，核对后即可生成计划");
+  };
+
+  // ---------- 计划 ----------
+  const handleCreatePlan = (patientId: string, draft: PlanDraft) => {
+    setData((d) => {
+      const plan = createPlan(d, patientId, draft, d.meta.specialist, new Date());
+      return { ...d, plans: [...d.plans, plan] };
+    });
+    setToast("新一周计划已生成（同一患者本周仅此一份）");
+  };
+
+  const handleRevisePlan = (
+    patientId: string,
+    targetWeek: string,
+    patch: Pick<PlanDraft, "targetMinutes" | "promptMethod" | "items">,
+    reason: string,
+  ) => {
+    setData((d) => {
+      const plan = d.plans.find((p) => p.patientId === patientId && p.weekKey === targetWeek);
+      if (!plan) throw new Error("未找到计划");
+      const next = revisePlan(plan, patch, reason, d.meta.specialist, new Date());
+      return { ...d, plans: d.plans.map((p) => (p.id === plan.id ? next : p)) };
+    });
+    setToast("已复制为新版本并记录调整原因");
+  };
+
+  // ---------- 训练记录 ----------
+  const addLog: (
+    patientId: string,
+    l: { date: string; ear: TrainingLog["ear"]; kind: TrainingLog["kind"]; minutes: number; difficulty: string; note: string },
+  ) => void = (patientId, l) => {
+    const log: TrainingLog = {
+      id: newId("log"),
+      patientId,
+      weekKey: weekKeyOfDate(l.date),
+      ...l,
+      createdAt: new Date().toISOString(),
+    };
+    setData((d) => ({ ...d, logs: [...d.logs, log] }));
+  };
+
+  // ---------- 复诊联系 ----------
+  const addContact = (
+    patientId: string,
+    note: Pick<ContactNote, "channel" | "content" | "author">,
+  ) => {
+    const record: ContactNote = {
+      id: newId("c"),
+      patientId,
+      date: todayKey(),
+      ...note,
+      createdAt: new Date().toISOString(),
+    };
+    setData((d) => ({ ...d, contacts: [...d.contacts, record] }));
+    setToast("联系记录已保存");
+  };
+
+  const reset = () => {
+    if (window.confirm("确定清空本地数据并恢复演示数据？所有计划、训练与联系记录都会重置。")) {
+      const seed = resetData();
+      setData(seed);
+      setSelectedId(seed.patients[0]?.id ?? "");
+      setToast("已恢复演示数据");
+    }
+  };
+
+  const editingPatient = data.patients.find((p) => p.id === audiEditId) ?? null;
+  const editingAudi = editingPatient ? latestAudiogram(data, editingPatient.id) : null;
+
+  const navItems: { key: View; label: string; badge?: number }[] = [
+    { key: "workbench", label: "康复作业台" },
+    { key: "followup", label: "复诊名单", badge: stats.followup },
+    { key: "patients", label: "患者档案" },
+  ];
+
   return (
-    <article className="metric-card">
-      <span>{label}</span>
-      <strong>{value}</strong>
-      <i className={statusColors[index % statusColors.length]} />
-    </article>
-  );
-}
-
-function App() {
-  const values = project.metrics.map((metric: string, index: number) => {
-    const base = [84, 12, 31, 7][index % 4];
-    return String(base + index * 3);
-  });
-
-  return (
-    <main className="app-shell">
-      <section className="hero">
-        <div>
-          <p className="eyebrow">{project.id} · port {project.port}</p>
-          <h1>{project.title}</h1>
-          <p className="subtitle">{project.subtitle}</p>
-        </div>
-        <div className="stack-card">
-          <span>技术栈</span>
-          <strong>{project.stack}</strong>
-        </div>
-      </section>
-
-      <section className="metrics-grid">
-        {project.metrics.map((metric: string, index: number) => (
-          <MetricCard key={metric} label={metric} value={values[index]} index={index} />
-        ))}
-      </section>
-
-      <section className="workspace">
-        <aside className="panel narrow">
-          <h2>角色</h2>
-          <div className="chips">
-            {project.users.map((user: string) => (
-              <span key={user}>{user}</span>
-            ))}
-          </div>
-          <h2>筛选</h2>
-          <div className="chips muted">
-            {project.filters.map((filter: string) => (
-              <button key={filter}>{filter}</button>
-            ))}
-          </div>
-        </aside>
-
-        <section className="panel">
-          <div className="section-heading">
-            <div>
-              <p>{project.domain}</p>
-              <h2>记录字段</h2>
-            </div>
-            <button className="primary-action">新增记录</button>
-          </div>
-          <div className="field-grid">
-            {project.fields.map((field: string) => (
-              <label key={field}>
-                <span>{field}</span>
-                <input placeholder={"填写" + field} />
-              </label>
-            ))}
-          </div>
-        </section>
-      </section>
-
-      <section className="records panel">
-        <div className="section-heading">
+    <div className="app">
+      <header className="app-header">
+        <div className="brand">
+          <span className="logo">耳</span>
           <div>
-            <p>示例数据</p>
-            <h2>近期记录</h2>
+            <h1>社区听力康复作业台</h1>
+            <p>按左右耳安排听辨与方向训练 · 听力师 · 家属 · 复诊助理协同</p>
           </div>
-          <button>导出摘要</button>
         </div>
-        <div className="record-list">
-          {project.records.map((record: string[], index: number) => (
-            <article key={record.join("-")} className="record-card">
-              <div className="record-index">{String(index + 1).padStart(2, "0")}</div>
-              <div>
-                <h3>{record[0]}</h3>
-                <p>{record.slice(1).join(" · ")}</p>
-              </div>
-            </article>
-          ))}
+        <div className="header-meta">
+          <span>{weekLabel(weekKey)}</span>
+          <span>听力师：{data.meta.specialist}</span>
+          <button onClick={reset} title="清空本地数据并恢复演示数据">重置演示数据</button>
+        </div>
+      </header>
+
+      <section className="stats-row">
+        <div className="stat"><span>在册老人</span><strong>{data.patients.length}</strong></div>
+        <div className="stat"><span>本周已排计划</span><strong>{stats.planned}<i> / {data.patients.length}</i></strong></div>
+        <div className="stat"><span>本周已训练</span><strong>{stats.done}<i> 分钟 · {stats.pendingLogs} 次登记</i></strong></div>
+        <div className={`stat ${stats.followup > 0 ? "stat-alert" : ""}`}>
+          <span>复诊名单（≥4 天未记录）</span>
+          <strong>{stats.followup}<i> 人</i></strong>
         </div>
       </section>
-    </main>
+
+      <nav className="tabs">
+        {navItems.map((n) => (
+          <button
+            key={n.key}
+            className={`tab ${view === n.key ? "active" : ""}`}
+            onClick={() => setView(n.key)}
+          >
+            {n.label}
+            {n.badge ? <i className="tab-badge">{n.badge}</i> : null}
+          </button>
+        ))}
+      </nav>
+
+      <main className="content">
+        {view === "workbench" && selectedPatient && (
+          <Workbench
+            data={data}
+            selectedId={selectedPatient.id}
+            onSelectPatient={setSelectedId}
+            handlers={{
+              checkAudiogram,
+              openAudiogramEditor: setAudiEditId,
+              createPlan: handleCreatePlan,
+              revisePlan: handleRevisePlan,
+              addLog,
+              updatePromptPreference,
+            }}
+          />
+        )}
+        {view === "followup" && (
+          <FollowupView
+            data={data}
+            onJump={(id) => {
+              setSelectedId(id);
+              setView("workbench");
+            }}
+            onAddContact={addContact}
+          />
+        )}
+        {view === "patients" && (
+          <PatientsView
+            data={data}
+            onAddPatient={addPatient}
+            onEditAudiogram={setAudiEditId}
+            onCheckAudiogram={checkAudiogram}
+            onOpenWorkbench={(id) => {
+              setSelectedId(id);
+              setView("workbench");
+            }}
+          />
+        )}
+      </main>
+
+      {editingPatient && (
+        <AudiogramModal
+          patientName={editingPatient.name}
+          original={editingAudi}
+          onClose={() => setAudiEditId(null)}
+          onSave={(next) => saveAudiogram(editingPatient.id, next)}
+        />
+      )}
+
+      {toast && <div className="toast">{toast}</div>}
+
+      <footer className="app-footer">
+        数据保存在本机浏览器（localStorage）：领域类型与字典（src/types、src/data）、业务规则（src/rules）、存储（src/storage）、页面（src/components）相互分开。
+      </footer>
+    </div>
   );
 }
-
-export default App;
